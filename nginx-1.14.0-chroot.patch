@@ -1,0 +1,254 @@
+diff --git a/src/core/nginx.c b/src/core/nginx.c
+index 9fcb0eb2..8d508c53 100644
+--- a/src/core/nginx.c
++++ b/src/core/nginx.c
+@@ -182,7 +182,7 @@ ngx_module_t  ngx_core_module = {
+ static ngx_uint_t   ngx_show_help;
+ static ngx_uint_t   ngx_show_version;
+ static ngx_uint_t   ngx_show_configure;
+-static u_char      *ngx_prefix;
++u_char             *ngx_prefix;
+ static u_char      *ngx_conf_file;
+ static u_char      *ngx_conf_params;
+ static char        *ngx_signal;
+@@ -418,6 +418,8 @@ ngx_show_version_info(void)
+                                ")" NGX_LINEFEED
+             "  -g directives : set global directives out of configuration "
+                                "file" NGX_LINEFEED NGX_LINEFEED
++            "  -u            : disable chroot(2) "
++                               "file" NGX_LINEFEED NGX_LINEFEED
+         );
+     }
+ 
+@@ -851,6 +853,10 @@ ngx_get_options(int argc, char *const *argv)
+                 ngx_log_stderr(0, "invalid option: \"-s %s\"", ngx_signal);
+                 return NGX_ERROR;
+ 
++            case 'u':
++                ngx_chrooted = 0;
++                break;
++
+             default:
+                 ngx_log_stderr(0, "invalid option: \"%c\"", *(p - 1));
+                 return NGX_ERROR;
+diff --git a/src/core/ngx_cycle.c b/src/core/ngx_cycle.c
+index f3ac24d7..efdb7723 100644
+--- a/src/core/ngx_cycle.c
++++ b/src/core/ngx_cycle.c
+@@ -1109,6 +1109,10 @@ ngx_reopen_files(ngx_cycle_t *cycle, ngx_uid_t user)
+             i = 0;
+         }
+ 
++        if ((ngx_process == NGX_PROCESS_WORKER) && ngx_chrooted) {
++            ngx_strip_chroot(&file[i].name);
++        }
++
+         if (file[i].name.len == 0) {
+             continue;
+         }
+diff --git a/src/core/ngx_file.c b/src/core/ngx_file.c
+index 3a94089d..620a2caa 100644
+--- a/src/core/ngx_file.c
++++ b/src/core/ngx_file.c
+@@ -597,6 +597,7 @@ ngx_add_path(ngx_conf_t *cf, ngx_path_t **slot)
+ ngx_int_t
+ ngx_create_paths(ngx_cycle_t *cycle, ngx_uid_t user)
+ {
++    u_char	     *prefix;
+     ngx_err_t         err;
+     ngx_uint_t        i;
+     ngx_path_t      **path;
+@@ -604,6 +605,21 @@ ngx_create_paths(ngx_cycle_t *cycle, ngx_uid_t user)
+     path = cycle->paths.elts;
+     for (i = 0; i < cycle->paths.nelts; i++) {
+ 
++        if (ngx_chrooted) {
++	  if (ngx_prefix)
++	    prefix = ngx_prefix;
++	  else
++	    prefix = NGX_PREFIX;
++          if (chdir(prefix) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "chdir(\"%s\") failed", prefix);
++            return NGX_ERROR;
++          }
++          ngx_strip_chroot(&path[i]->name);
++          path[i]->name.data++;
++          path[i]->name.len--;
++        }
++
+         if (ngx_create_dir(path[i]->name.data, 0700) == NGX_FILE_ERROR) {
+             err = ngx_errno;
+             if (err != NGX_EEXIST) {
+diff --git a/src/core/ngx_string.c b/src/core/ngx_string.c
+index 2ee07bfc..151fb836 100644
+--- a/src/core/ngx_string.c
++++ b/src/core/ngx_string.c
+@@ -2027,3 +2027,27 @@ ngx_memcpy(void *dst, const void *src, size_t n)
+ }
+ 
+ #endif
++
++void
++ngx_strip_chroot(ngx_str_t *path)
++{
++    int plen;
++    u_char *prefix;
++
++    if (ngx_prefix)
++	prefix = ngx_prefix;
++    else
++	prefix = NGX_PREFIX;
++
++    if (prefix[strlen(prefix) - 1] == '/')
++	plen = strlen(prefix) - 1;
++    else
++	plen = strlen(prefix);
++
++    if (!ngx_strncmp(path->data, prefix, strlen(prefix))) {
++       char *x, *buf = malloc(path->len);
++       x = ngx_cpystrn(buf, path->data + plen, path->len);
++       path->len = (x - buf);
++       path->data = buf;
++    }
++}
+diff --git a/src/core/ngx_string.h b/src/core/ngx_string.h
+index 882ae7ce..479cb84c 100644
+--- a/src/core/ngx_string.h
++++ b/src/core/ngx_string.h
+@@ -232,5 +232,6 @@ void ngx_sort(void *base, size_t n, size_t size,
+ #define ngx_value_helper(n)   #n
+ #define ngx_value(n)          ngx_value_helper(n)
+ 
++void ngx_strip_chroot(ngx_str_t *root);
+ 
+ #endif /* _NGX_STRING_H_INCLUDED_ */
+diff --git a/src/http/modules/ngx_http_auth_basic_module.c b/src/http/modules/ngx_http_auth_basic_module.c
+index a6f9ec46..66b98353 100644
+--- a/src/http/modules/ngx_http_auth_basic_module.c
++++ b/src/http/modules/ngx_http_auth_basic_module.c
+@@ -415,6 +415,10 @@ ngx_http_auth_basic_user_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ 
+     ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+ 
++    if (ngx_chrooted) {
++        ngx_strip_chroot(&value[1]);
++    }
++
+     ccv.cf = cf;
+     ccv.value = &value[1];
+     ccv.complex_value = &alcf->user_file;
+diff --git a/src/http/ngx_http_core_module.c b/src/http/ngx_http_core_module.c
+index 6b318dd0..0f81683f 100644
+--- a/src/http/ngx_http_core_module.c
++++ b/src/http/ngx_http_core_module.c
+@@ -4239,6 +4239,10 @@ ngx_http_core_root(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ 
+     value = cf->args->elts;
+ 
++    if (ngx_chrooted && value[1].data != NULL) {
++        ngx_strip_chroot(&value[1]);
++    }
++
+     if (ngx_strstr(value[1].data, "$document_root")
+         || ngx_strstr(value[1].data, "${document_root}"))
+     {
+diff --git a/src/os/unix/ngx_process.h b/src/os/unix/ngx_process.h
+index 3986639b..0054205b 100644
+--- a/src/os/unix/ngx_process.h
++++ b/src/os/unix/ngx_process.h
+@@ -78,6 +78,7 @@ void ngx_debug_point(void);
+ extern int            ngx_argc;
+ extern char         **ngx_argv;
+ extern char         **ngx_os_argv;
++extern u_char	     *ngx_prefix;
+ 
+ extern ngx_pid_t      ngx_pid;
+ extern ngx_pid_t      ngx_parent;
+diff --git a/src/os/unix/ngx_process_cycle.c b/src/os/unix/ngx_process_cycle.c
+index 5817a2c2..60d8f725 100644
+--- a/src/os/unix/ngx_process_cycle.c
++++ b/src/os/unix/ngx_process_cycle.c
+@@ -46,6 +46,7 @@ sig_atomic_t  ngx_reopen;
+ sig_atomic_t  ngx_change_binary;
+ ngx_pid_t     ngx_new_binary;
+ ngx_uint_t    ngx_inherited;
++ngx_uint_t    ngx_chrooted = 1;
+ ngx_uint_t    ngx_daemonized;
+ 
+ sig_atomic_t  ngx_noaccept;
+@@ -785,6 +786,8 @@ ngx_worker_process_init(ngx_cycle_t *cycle, ngx_int_t worker)
+     ngx_time_t       *tp;
+     ngx_uint_t        i;
+     ngx_cpuset_t     *cpu_affinity;
++    struct passwd    *pw;
++    struct stat       stb;
+     struct rlimit     rlmt;
+     ngx_core_conf_t  *ccf;
+     ngx_listening_t  *ls;
+@@ -826,6 +829,53 @@ ngx_worker_process_init(ngx_cycle_t *cycle, ngx_int_t worker)
+     }
+ 
+     if (geteuid() == 0) {
++	char *prefix;
++
++        if (!ngx_chrooted) {
++            goto nochroot;
++        }
++
++	if ((pw = getpwnam(ccf->username)) == NULL) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "getpwnam(%s) failed", ccf->username);
++            /* fatal */
++            exit(2);
++	}
++
++	if (ngx_prefix)
++	    prefix = (char *)ngx_prefix;
++	else
++	    prefix = pw->pw_dir;
++
++	if (stat(prefix, &stb) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "stat(%s) failed", prefix);
++            /* fatal */
++            exit(2);
++	}
++
++	if (stb.st_uid != 0 || (stb.st_mode & (S_IWGRP|S_IWOTH)) != 0) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "bad privsep dir permissions on %s", prefix);
++            /* fatal */
++            exit(2);
++	}
++
++	if (chroot(prefix) == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "chroot(%s) failed", prefix);
++            /* fatal */
++            exit(2);
++	}
++
++	if (chdir("/") == -1) {
++            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
++                          "chdir(\"/\") failed");
++            /* fatal */
++            exit(2);
++	}
++
++nochroot:
+         if (setgid(ccf->group) == -1) {
+             ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
+                           "setgid(%d) failed", ccf->group);
+diff --git a/src/os/unix/ngx_process_cycle.h b/src/os/unix/ngx_process_cycle.h
+index 69495d5f..19ebe5c3 100644
+--- a/src/os/unix/ngx_process_cycle.h
++++ b/src/os/unix/ngx_process_cycle.h
+@@ -43,6 +43,7 @@ extern ngx_uint_t      ngx_worker;
+ extern ngx_pid_t       ngx_pid;
+ extern ngx_pid_t       ngx_new_binary;
+ extern ngx_uint_t      ngx_inherited;
++extern ngx_uint_t      ngx_chrooted;
+ extern ngx_uint_t      ngx_daemonized;
+ extern ngx_uint_t      ngx_exiting;
+ 
